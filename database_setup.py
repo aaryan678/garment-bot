@@ -157,4 +157,4 @@ def backup_database():
 if __name__ == "__main__":
     # Initialize the database when this file is run directly
     init_database()
-    print("Database setup complete!") 
+    print("Database setup complete!!")
