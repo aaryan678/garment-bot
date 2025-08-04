@@ -13,14 +13,8 @@ STAGE_LABELS = [
     "Inline", "Packing", "Dispatch"
 ]
 
-DATABASE_URL = os.environ["DATABASE_URL"]      # new env var
-engine = create_engine(
-    DATABASE_URL,
-    echo=False,
-    future=True,
-    pool_pre_ping=True,        # avoids idle-timeout hiccups
-)                   # one file, lives next to app.py
-# engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
+DB_PATH = "/var/lib/bot/production.db"                      # one file, lives next to app.py
+engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
 Base = declarative_base()
 Session = sessionmaker(bind=engine, expire_on_commit=False)
 
@@ -157,4 +151,4 @@ def backup_database():
 if __name__ == "__main__":
     # Initialize the database when this file is run directly
     init_database()
-    print("Database setup complete!!")
+    print("Database setup complete!") 
