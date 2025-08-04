@@ -174,4 +174,4 @@ The bot runs on port 3000 by default. For production, use a proper WSGI server l
 ```bash
 pip install gunicorn
 gunicorn -w 4 -b 0.0.0.0:3000 app:flask_app
-``` 
+``` # garment-bot
