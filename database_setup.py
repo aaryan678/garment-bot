@@ -36,7 +36,7 @@ STAGE_LABELS = [
 ]
 
 # Store TinyDB JSON next to the application (same location as previous DB)
-DB_PATH = Path("/var/lib/bot/production.json")
+DB_PATH = Path("production.json")
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 _db = TinyDB(DB_PATH)
