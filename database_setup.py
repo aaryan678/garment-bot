@@ -3,6 +3,7 @@ from sqlalchemy import (create_engine, Column, Integer, String, DateTime,
                         Boolean, Date, func)
 from sqlalchemy.orm import declarative_base, sessionmaker
 import os
+from sqlalchemy import create_engine
 
 # Stage labels for the workflow
 STAGE_LABELS = [
@@ -12,8 +13,14 @@ STAGE_LABELS = [
     "Inline", "Packing", "Dispatch"
 ]
 
-DB_PATH = "/var/lib/bot/production.db"                      # one file, lives next to app.py
-engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
+DATABASE_URL = os.environ["DATABASE_URL"]      # new env var
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    future=True,
+    pool_pre_ping=True,        # avoids idle-timeout hiccups
+)                   # one file, lives next to app.py
+# engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
 Base = declarative_base()
 Session = sessionmaker(bind=engine, expire_on_commit=False)
 
