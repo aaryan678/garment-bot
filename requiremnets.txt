@@ -47,3 +47,4 @@ pytz
 gevent
 gunicorn
 psycopg2
+tinydb
