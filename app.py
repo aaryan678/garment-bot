@@ -5,6 +5,10 @@ from flask import Flask, request
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 
+
+
+
+
 # ----------  LOCAL DB SETUP  ----------
 from database_setup import Session, Style, STAGE_LABELS
 
@@ -520,6 +524,16 @@ def get_harsh_user_id():
     except Exception as e:
         print(f"Could not find Harsh Lalwani: {e}")
     return None
+
+
+
+@flask_app.route("/")
+def index():
+    return "✅ Slack bot is live!", 200
+
+@flask_app.route("/ping")
+def ping():
+    return "pong", 200
 
 
 if __name__ == "__main__":
