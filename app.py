@@ -441,6 +441,68 @@ def handle_add_style_submission(ack, body, view, client, logger):
     client.chat_postMessage(channel=user_id,
                             text=":white_check_mark: Style saved!\n" + msg)
 
+@bolt_app.command("/get-info")
+def handle_get_info(ack, respond):
+    ack()
+    respond(
+        blocks=[
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*👋 Welcome to Garment Bot!*\nHere’s everything you need to know:"
+                }
+            },
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*🛠️ Available Commands:*\n"
+                            "`/add-style` – Add a new garment style with optional photo\n"
+                            "`/update-status` – Update the production stage of an existing style\n"
+                            "`/current-styles` – View all styles you're handling\n"
+                            "`/morning-update` – Bulk update all your styles for today\n"
+                            "`/get-info` – Show this help message"
+                }
+            },
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*⚠️ If the bot doesn’t respond right away…*\n"
+                            "The bot might be asleep. This can happen if it hasn't been used recently.\n\n"
+                            "• Type `hi`\n"
+                            "• If no reply, wait ~50 seconds and type `hi` again\n"
+                            "Once you get a wave 👋 back, the bot is live!"
+                }
+            },
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*📦 Technical Notes:*\n"
+                            "• Pings from UptimeRobot keep it awake"
+                }
+            },
+            {"type": "divider"},
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": "Have questions or ideas? Reach out to <@aaryan> 💬"
+                    }
+                ]
+            }
+        ]
+    )
+
+
+
+
 
 # ---------- DAILY REMINDER SCHEDULER ----------
 from apscheduler.schedulers.background import BackgroundScheduler
