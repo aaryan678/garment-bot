@@ -10,7 +10,14 @@ from slack_bolt.adapter.flask import SlackRequestHandler
 
 
 # ----------  LOCAL DB SETUP  ----------
-from database_setup import Session, Style, STAGE_LABELS
+from database_setup import (
+    STAGE_LABELS,
+    add_style,
+    get_all_styles,
+    get_style_by_id,
+    get_styles_by_merchant,
+    update_style_stage,
+)
 
 load_dotenv()  # pulls SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET from .env
 
@@ -36,14 +43,8 @@ def list_current_styles(ack, body, client, logger):
     prof = client.users_info(user=user_id)["user"]["profile"]
     merchant = prof.get("display_name") or prof["real_name"]
 
-    # Pull this merchant's styles from SQLite
-    with Session() as db:
-        rows = (
-            db.query(Style)
-              .filter_by(merchant=merchant, active=True)
-              .order_by(Style.created_at.desc())
-              .all()
-        )
+    # Pull this merchant's styles from TinyDB
+    rows = get_styles_by_merchant(merchant, active_only=True)
 
     if not rows:
         client.chat_postEphemeral(
@@ -75,11 +76,10 @@ def open_stage_modal(ack, body, client, logger):
     prof    = client.users_info(user=user_id)["user"]["profile"]
     merchant = prof.get("display_name") or prof["real_name"]
 
-    with Session() as db:
-        rows = (db.query(Style)
-                  .filter_by(merchant=merchant, active=True)
-                  .order_by(Style.created_at)
-                  .all())
+    rows = sorted(
+        get_styles_by_merchant(merchant, active_only=True),
+        key=lambda r: r.created_at,
+    )
 
     if not rows:
         client.chat_postEphemeral(
@@ -132,16 +132,12 @@ def save_stage_update(ack, body, view, client, logger):
     new_stage= int(view["state"]["values"]["stage"]["val"]["selected_option"]["value"])
     user_id  = body["user"]["id"]
 
-    with Session() as db:
-        sty = db.query(Style).filter_by(id=style_id).first()
-        if not sty:
-            logger.warning(f"Style {style_id} vanished")
-            return
+    sty = get_style_by_id(style_id)
+    if not sty:
+        logger.warning(f"Style {style_id} vanished")
+        return
 
-        sty.stage  = new_stage
-        if new_stage == 13:                   # Dispatch  → deactivate
-            sty.active = False
-        db.commit()
+    update_style_stage(style_id, new_stage)
 
     client.chat_postMessage(
         channel=user_id,
@@ -160,11 +156,10 @@ def open_bulk_modal(ack, body, client):
     merchant = prof.get("display_name") or prof["real_name"]
 
     # grab active styles
-    with Session() as db:
-        rows = (db.query(Style)
-                  .filter_by(merchant=merchant, active=True)
-                  .order_by(Style.created_at)
-                  .all())
+    rows = sorted(
+        get_styles_by_merchant(merchant, active_only=True),
+        key=lambda r: r.created_at,
+    )
 
     if not rows:
         client.chat_postEphemeral(
@@ -220,21 +215,18 @@ def save_bulk_update(ack, body, view, client, logger):
     merchant = prof.get("display_name") or prof["real_name"]
     changes, dispatched = [], []
 
-    with Session() as db:
-        for blk_id, blk_val in view["state"]["values"].items():
-            if not blk_id.startswith("style_"):
-                continue
-            style_id = int(blk_id.split("_")[1])
-            new_stage = int(blk_val["stage_select"]["selected_option"]["value"])
-            sty = db.query(Style).filter_by(id=style_id).first()
-            if not sty or sty.stage == new_stage:
-                continue
-            sty.stage = new_stage
-            if new_stage == 13:
-                sty.active = False
-                dispatched.append(f"{sty.brand}·{sty.style_no}")
-            changes.append(f"{sty.brand}·{sty.style_no} → *{STAGE_LABELS[new_stage]}*")
-        db.commit()
+    for blk_id, blk_val in view["state"]["values"].items():
+        if not blk_id.startswith("style_"):
+            continue
+        style_id = int(blk_id.split("_")[1])
+        new_stage = int(blk_val["stage_select"]["selected_option"]["value"])
+        sty = get_style_by_id(style_id)
+        if not sty or sty.stage == new_stage:
+            continue
+        update_style_stage(style_id, new_stage)
+        if new_stage == 13:
+            dispatched.append(f"{sty.brand}·{sty.style_no}")
+        changes.append(f"{sty.brand}·{sty.style_no} → *{STAGE_LABELS[new_stage]}*")
 
     # Confirmation DM to merchant
     txt = ["✅ *Morning update received!*"]
@@ -430,18 +422,13 @@ def handle_add_style_submission(ack, body, view, client, logger):
     merchant = profile.get("display_name") or profile["real_name"]
 
     # Save to database
-    with Session() as db:
-        style_row = Style(
-            merchant = merchant,
-            brand    = brand,
-            style_no = style_no,
-            garment  = garment,
-            colour   = color,
-            stage    = 0,           # NEW
-            active   = True
-        )
-        db.add(style_row)
-        db.commit()
+    add_style(
+        merchant=merchant,
+        brand=brand,
+        style_no=style_no,
+        garment=garment,
+        colour=color,
+    )
 
     logger.info(f"New style from {user_id}: {brand}-{style_no}")
 
@@ -464,33 +451,33 @@ import datetime
 ALLOWED_MERCHANTS = {"Siddharth", "Megha"}
 
 def send_daily_reminder():
-    with Session() as db:
-        # Get all unique merchants with active styles
-        merchants = db.query(Style.merchant).filter_by(active=True).distinct().all()
-        if not merchants:
-            return
-        # For each merchant, find a user_id to DM (by looking up the most recent style)
-        for (merchant,) in merchants:
-            if merchant not in ALLOWED_MERCHANTS:
+    styles = get_all_styles()
+    merchants = {s.merchant for s in styles if s.active}
+    if not merchants:
+        return
+    for merchant in merchants:
+        if merchant not in ALLOWED_MERCHANTS:
+            continue
+        merchant_styles = [s for s in styles if s.merchant == merchant and s.active]
+        if not merchant_styles:
+            continue
+        merchant_styles.sort(key=lambda s: s.created_at, reverse=True)
+        style = merchant_styles[0]
+        # Try to find the Slack user_id for this merchant
+        try:
+            users = bolt_app.client.users_list()["members"]
+            user_id = None
+            for u in users:
+                prof = u.get("profile", {})
+                if prof.get("display_name") == merchant or prof.get("real_name") == merchant:
+                    user_id = u["id"]
+                    break
+            if not user_id:
                 continue
-            style = db.query(Style).filter_by(merchant=merchant, active=True).order_by(Style.created_at.desc()).first()
-            if not style:
-                continue
-            # Try to find the Slack user_id for this merchant
-            try:
-                users = bolt_app.client.users_list()["members"]
-                user_id = None
-                for u in users:
-                    prof = u.get("profile", {})
-                    if prof.get("display_name") == merchant or prof.get("real_name") == merchant:
-                        user_id = u["id"]
-                        break
-                if not user_id:
-                    continue
-            except Exception as e:
-                print(f"Could not find user for merchant {merchant}: {e}")
-                continue
-            # Compose the message
+        except Exception as e:
+            print(f"Could not find user for merchant {merchant}: {e}")
+            continue
+        # Compose the message
             msg = (
                 "Good morning! ☀️\n\n"
                 "Please fill in your daily style report using `/morning-update`.\n\n"

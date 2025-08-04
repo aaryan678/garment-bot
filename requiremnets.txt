@@ -29,7 +29,6 @@ requests-oauthlib==2.0.0
 rsa==4.9.1
 slack_bolt==1.23.0
 slack_sdk==3.36.0
-SQLAlchemy==2.0.42
 typing_extensions==4.14.1
 tzlocal==5.3.1
 uritemplate==4.2.0
@@ -39,12 +38,8 @@ zipp==3.23.0
 pytz==2023.4
 flask
 slack-bolt[flask]
-sqlalchemy
-psycopg[binary]
 python-dotenv
 apscheduler
-pytz
 gevent
 gunicorn
-psycopg2
 tinydb

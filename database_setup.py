@@ -1,154 +1,172 @@
-# ----------  LOCAL DB SETUP  ----------
-from sqlalchemy import (create_engine, Column, Integer, String, DateTime,
-                        Boolean, Date, func)
-from sqlalchemy.orm import declarative_base, sessionmaker
-import os
-from sqlalchemy import create_engine
+"""TinyDB-backed storage for style tracking.
 
-# Stage labels for the workflow
+This module replaces the previous SQLAlchemy/SQLite setup with a much
+lighter TinyDB JSON database.  All helper functions return simple objects
+with attribute access to keep the rest of the application code small.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, date
+from pathlib import Path
+from types import SimpleNamespace
+from typing import List, Optional
+
+from tinydb import TinyDB, Query
+
+# ---------------------------------------------------------------------------
+# Constants / setup
+# ---------------------------------------------------------------------------
+
 STAGE_LABELS = [
-    "Pre-fit", "Fit", "Bulk", "Bulk in-house",
-    "FPT", "GPT", "PP", "Accessories in-house",
-    "Cutting sheet", "Stitching", "Finishing",
-    "Inline", "Packing", "Dispatch"
+    "Pre-fit",
+    "Fit",
+    "Bulk",
+    "Bulk in-house",
+    "FPT",
+    "GPT",
+    "PP",
+    "Accessories in-house",
+    "Cutting sheet",
+    "Stitching",
+    "Finishing",
+    "Inline",
+    "Packing",
+    "Dispatch",
 ]
 
-DB_PATH = "/var/lib/bot/production.db"                      # one file, lives next to app.py
-engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
-Base = declarative_base()
-Session = sessionmaker(bind=engine, expire_on_commit=False)
+# Store TinyDB JSON next to the application (same location as previous DB)
+DB_PATH = Path("/var/lib/bot/production.json")
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-class Style(Base):
-    """One row per style, keyed on merchant + style_no."""
-    __tablename__ = "styles"
-    id         = Column(Integer, primary_key=True)
-    merchant   = Column(String(64), nullable=False)
-    brand      = Column(String(64), nullable=False)
-    style_no   = Column(String(64), nullable=False)
-    garment    = Column(String(64), nullable=False)
-    colour     = Column(String(64), nullable=False)
+_db = TinyDB(DB_PATH)
+_styles = _db.table("styles")
+Q = Query()
 
-    stage      = Column(Integer, default=0)    # 0 ≙ Pre-fit
-    active     = Column(Boolean, default=True)
 
-    # placeholders for the extra data we'll capture later
-    bulk_eta   = Column(Date,     nullable=True)
-    acc_barcode  = Column(String, nullable=True)
-    acc_trims    = Column(String, nullable=True)
-    acc_washcare = Column(String, nullable=True)
-    acc_other    = Column(String, nullable=True)
-    stitch_qty   = Column(Integer, nullable=True)
-    finish_qty   = Column(Integer, nullable=True)
-    pack_qty     = Column(Integer, nullable=True)
+def _to_style(doc) -> SimpleNamespace:
+    """Convert a TinyDB document to an object with attribute access."""
+    data = dict(doc)
+    data["created_at"] = datetime.fromisoformat(data["created_at"])
+    return SimpleNamespace(id=doc.doc_id, **data)
 
-    created_at = Column(DateTime, default=func.now())
 
-    __table_args__ = (
-        # optional uniqueness so the same merchant can't add dupes
-        {"sqlite_autoincrement": True},
+# ---------------------------------------------------------------------------
+# CRUD helpers
+# ---------------------------------------------------------------------------
+
+def add_style(merchant: str, brand: str, style_no: str, garment: str, colour: str) -> int:
+    """Add a new style to the database and return its ID."""
+
+    doc_id = _styles.insert(
+        {
+            "merchant": merchant,
+            "brand": brand,
+            "style_no": style_no,
+            "garment": garment,
+            "colour": colour,
+            "stage": 0,
+            "active": True,
+            "created_at": datetime.utcnow().isoformat(),
+            "bulk_eta": None,
+            "acc_barcode": None,
+            "acc_trims": None,
+            "acc_washcare": None,
+            "acc_other": None,
+            "stitch_qty": None,
+            "finish_qty": None,
+            "pack_qty": None,
+        }
     )
+    return int(doc_id)
 
-def init_database():
-    """Initialize the database and create tables."""
-    Base.metadata.create_all(engine)
-    print(f"Database initialized at: {os.path.abspath(DB_PATH)}")
 
-def add_style(merchant, brand, style_no, garment, colour):
-    """Add a new style to the database."""
-    with Session() as db:
-        style_row = Style(
-            merchant = merchant,
-            brand    = brand,
-            style_no = style_no,
-            garment  = garment,
-            colour   = colour,
-            stage    = 0,
-            active   = True
-        )
-        db.add(style_row)
-        db.commit()
-        return style_row.id
+def get_styles_by_merchant(merchant: str, active_only: bool = True) -> List[SimpleNamespace]:
+    """Return all styles for a given merchant sorted by creation time (newest first)."""
 
-def get_styles_by_merchant(merchant, active_only=True):
-    """Get all styles for a specific merchant."""
-    with Session() as db:
-        query = db.query(Style).filter_by(merchant=merchant)
-        if active_only:
-            query = query.filter_by(active=True)
-        styles = query.order_by(Style.created_at.desc()).all()
-        return styles
+    docs = _styles.search(Q.merchant == merchant)
+    if active_only:
+        docs = [d for d in docs if d.get("active", True)]
+    docs.sort(key=lambda d: datetime.fromisoformat(d["created_at"]), reverse=True)
+    return [_to_style(d) for d in docs]
 
-def get_all_styles():
-    """Get all styles from the database."""
-    with Session() as db:
-        styles = (
-            db.query(Style)
-              .order_by(Style.created_at.desc())
-              .all()
-        )
-        return styles
 
-def update_style_stage(style_id, stage):
-    """Update the stage of a specific style."""
-    with Session() as db:
-        style = db.query(Style).filter_by(id=style_id).first()
-        if style:
-            style.stage = stage
-            if stage == 13:  # Dispatch stage → deactivate
-                style.active = False
-            db.commit()
+def get_all_styles() -> List[SimpleNamespace]:
+    """Return all styles in the database sorted by creation time (newest first)."""
 
-def get_style_by_id(style_id):
-    """Get a specific style by ID."""
-    with Session() as db:
-        style = db.query(Style).filter_by(id=style_id).first()
-        return style
+    docs = _styles.all()
+    docs.sort(key=lambda d: datetime.fromisoformat(d["created_at"]), reverse=True)
+    return [_to_style(d) for d in docs]
 
-def delete_style(style_id):
-    """Soft delete a style by ID (archive it)."""
-    with Session() as db:
-        style = db.query(Style).filter_by(id=style_id).first()
-        if style and style.active:
-            style.active = False
-            db.commit()
-            return True
-        return False
 
-def get_archived_styles_by_merchant(merchant):
-    """Get all archived (inactive) styles for a specific merchant."""
-    with Session() as db:
-        styles = (
-            db.query(Style)
-              .filter_by(merchant=merchant, active=False)
-              .order_by(Style.created_at.desc())
-              .all()
-        )
-        return styles
+def get_style_by_id(style_id: int) -> Optional[SimpleNamespace]:
+    """Fetch a single style by its ID."""
 
-def restore_style(style_id):
-    """Restore an archived style by ID (set active=True)."""
-    with Session() as db:
-        style = db.query(Style).filter_by(id=style_id).first()
-        if style and not style.active:
-            style.active = True
-            db.commit()
-            return True
-        return False
+    doc = _styles.get(doc_id=style_id)
+    return _to_style(doc) if doc else None
 
-def backup_database():
-    """Create a backup of the database."""
+
+def update_style_stage(style_id: int, stage: int) -> None:
+    """Update the stage of a style. Dispatch (13) marks it inactive."""
+
+    doc = _styles.get(doc_id=style_id)
+    if not doc:
+        return
+
+    doc["stage"] = stage
+    if stage == 13:  # Dispatch stage → deactivate
+        doc["active"] = False
+    _styles.update(doc, doc_ids=[style_id])
+
+
+def delete_style(style_id: int) -> bool:
+    """Soft delete a style by setting active=False."""
+
+    doc = _styles.get(doc_id=style_id)
+    if doc and doc.get("active", True):
+        _styles.update({"active": False}, doc_ids=[style_id])
+        return True
+    return False
+
+
+def get_archived_styles_by_merchant(merchant: str) -> List[SimpleNamespace]:
+    """Return all archived (inactive) styles for a merchant."""
+
+    docs = _styles.search((Q.merchant == merchant) & (Q.active == False))
+    docs.sort(key=lambda d: datetime.fromisoformat(d["created_at"]), reverse=True)
+    return [_to_style(d) for d in docs]
+
+
+def restore_style(style_id: int) -> bool:
+    """Reactivate an archived style."""
+
+    doc = _styles.get(doc_id=style_id)
+    if doc and not doc.get("active", True):
+        _styles.update({"active": True}, doc_ids=[style_id])
+        return True
+    return False
+
+
+def backup_database() -> None:
+    """Create a dated backup of the TinyDB file."""
+
     import shutil
-    import datetime
-    
-    backup_dir = "backups"
-    if not os.path.exists(backup_dir):
-        os.makedirs(backup_dir)
-    
-    backup_path = f"{backup_dir}/production_{datetime.date.today()}.db"
+
+    backup_dir = Path("backups")
+    backup_dir.mkdir(exist_ok=True)
+    backup_path = backup_dir / f"production_{date.today()}.json"
     shutil.copyfile(DB_PATH, backup_path)
     print(f"Database backed up to: {backup_path}")
 
+
+def init_database() -> None:
+    """Ensure the database file exists."""
+
+    _styles.all()  # touching the table creates the file on disk
+    print(f"Database initialized at: {DB_PATH.resolve()}")
+
+
 if __name__ == "__main__":
-    # Initialize the database when this file is run directly
     init_database()
-    print("Database setup complete!") 
+    print("Database setup complete!")
+
