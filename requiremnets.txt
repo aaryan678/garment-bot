@@ -46,3 +46,4 @@ apscheduler
 pytz
 gevent
 gunicorn
+psycopg2
