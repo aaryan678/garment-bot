@@ -180,19 +180,20 @@ def save_stage_update(ack, body, view, client, logger):
 # New handler: quantities modal submission (single)
 @bolt_app.view("qty_update_submit")
 def save_qty_update(ack, body, view, client, logger):
-    ack()
     try:
         meta = json.loads(view.get("private_metadata") or "{}")
         style_id = int(meta.get("style_id"))
         new_stage = int(meta.get("new_stage"))
     except Exception:
         logger.error("qty_update_submit: invalid private_metadata")
+        ack(response_action="clear")
         return
 
     user_id = body["user"]["id"]
     sty = get_style_by_id(style_id)
     if not sty:
         logger.warning(f"Style {style_id} vanished in qty submit")
+        ack(response_action="clear")
         return
 
     def _to_int(v):
@@ -220,6 +221,7 @@ def save_qty_update(ack, body, view, client, logger):
         parts.append("Quantities — " + ", ".join(qparts))
     parts.append("\nTo download a CSV of your styles, type `/export-csv`.")
     client.chat_postMessage(channel=user_id, text="\n".join(parts))
+    ack(response_action="clear")
 
 # ---------- /morning-update (open huge modal) ----------
 @bolt_app.command("/morning-update")
@@ -367,7 +369,7 @@ def save_bulk_update(ack, body, view, client, logger):
 # New handler: bulk quantities submission
 @bolt_app.view("bulk_qty_submit")
 def handle_bulk_qty_submit(ack, body, view, client, logger):
-    ack()
+    ack(response_action="clear")
     try:
         data = json.loads(view.get("private_metadata") or "{}")
         desired_changes = data.get("changes", [])
@@ -432,6 +434,7 @@ def handle_bulk_qty_submit(ack, body, view, client, logger):
 @bolt_app.command("/export-csv")
 def export_csv(ack, body, client, respond, logger):
     ack()
+    respond(text=":hourglass_flowing_sand: Generating your CSV, I’ll DM it to you shortly…", response_type="ephemeral")
     try:
         user_id = body.get("user_id")
         profile = client.users_info(user=user_id)["user"]["profile"]
@@ -465,21 +468,33 @@ def export_csv(ack, body, client, respond, logger):
         content = buf.getvalue()
         buf.close()
 
-        # Open IM and upload file
+        # Open IM and upload file (use v2 API for robustness)
         im = client.conversations_open(users=user_id)
         channel_id = im["channel"]["id"]
         filename = f"styles_{merchant.replace(' ', '_').lower()}.csv"
-        client.files_upload(
-            channels=channel_id,
-            content=content,
-            filename=filename,
-            filetype="csv",
-            initial_comment=":arrow_down: Here is your CSV export of active styles.",
-            title=f"{merchant} styles export"
-        )
+        try:
+            client.files_upload_v2(
+                channel=channel_id,
+                initial_comment=":arrow_down: Here is your CSV export of active styles.",
+                filename=filename,
+                content=content,
+                title=f"{merchant} styles export",
+                filetype="csv",
+            )
+        except Exception as upload_err:
+            # Fallback to legacy API
+            client.files_upload(
+                channels=channel_id,
+                content=content,
+                filename=filename,
+                filetype="csv",
+                initial_comment=":arrow_down: Here is your CSV export of active styles.",
+                title=f"{merchant} styles export"
+            )
+        respond(text=":white_check_mark: Sent you a DM with the CSV.", response_type="ephemeral")
     except Exception as e:
         logger.error(f"/export-csv failed: {e}")
-        respond(text=":warning: Failed to generate CSV. Please try again.", response_type="ephemeral")
+        respond(text=f":warning: Failed to generate CSV: {e}", response_type="ephemeral")
 
 
 flask_app = Flask(__name__)     # single Flask wrapper
