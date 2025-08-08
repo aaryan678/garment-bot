@@ -1,5 +1,5 @@
 # app.py  — minimal “hi → hello” bot
-import os, re
+import os, re, json, csv, io
 from dotenv import load_dotenv
 from flask import Flask, request
 from slack_bolt import App
@@ -17,6 +17,7 @@ from database_setup import (
     get_style_by_id,
     get_styles_by_merchant,
     update_style_stage,
+    update_style_quantities,
 )
 
 load_dotenv()  # pulls SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET from .env
@@ -126,25 +127,98 @@ def open_stage_modal(ack, body, client, logger):
 # ---------- modal submit ----------
 @bolt_app.view("stage_update_submit")
 def save_stage_update(ack, body, view, client, logger):
-    ack()
-
+    # Compute selections first to decide whether to push a follow-up modal
     style_id = int(view["state"]["values"]["style"]["val"]["selected_option"]["value"])
     new_stage= int(view["state"]["values"]["stage"]["val"]["selected_option"]["value"])
     user_id  = body["user"]["id"]
 
     sty = get_style_by_id(style_id)
     if not sty:
+        ack()
         logger.warning(f"Style {style_id} vanished")
         return
 
-    update_style_stage(style_id, new_stage)
+    # Flow stages: Cutting sheet (8), Inline (9), Stitching (10), Finishing (11), Packing (12)
+    if new_stage in (8, 9, 10, 11, 12):
+        # Push a follow-up modal to collect quantities
+        qty_view = {
+            "type": "modal",
+            "callback_id": "qty_update_submit",
+            "private_metadata": json.dumps({"style_id": style_id, "new_stage": new_stage}),
+            "title": {"type": "plain_text", "text": "Update Quantities"},
+            "submit": {"type": "plain_text", "text": "Save"},
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*{sty.brand}* • {sty.style_no} \nProvide quantities for the flow:"}},
+                {"type": "input", "block_id": "cut", "optional": True,
+                 "element": {"type": "plain_text_input", "action_id": "val"},
+                 "label": {"type": "plain_text", "text": "Cutting qty"}},
+                {"type": "input", "block_id": "stitch", "optional": True,
+                 "element": {"type": "plain_text_input", "action_id": "val"},
+                 "label": {"type": "plain_text", "text": "Stitching qty"}},
+                {"type": "input", "block_id": "finish", "optional": True,
+                 "element": {"type": "plain_text_input", "action_id": "val"},
+                 "label": {"type": "plain_text", "text": "Finishing qty"}},
+                {"type": "input", "block_id": "pack", "optional": True,
+                 "element": {"type": "plain_text_input", "action_id": "val"},
+                 "label": {"type": "plain_text", "text": "Packing qty"}},
+            ],
+        }
+        ack(response_action="push", view=qty_view)
+        return
 
+    # Otherwise, just update and notify
+    ack()
+    update_style_stage(style_id, new_stage)
     client.chat_postMessage(
         channel=user_id,
         text=(f":truck: *Stage updated*\n"
               f"{sty.brand}·{sty.style_no} is now "
               f"*{STAGE_LABELS[new_stage]}*")
     )
+
+# New handler: quantities modal submission (single)
+@bolt_app.view("qty_update_submit")
+def save_qty_update(ack, body, view, client, logger):
+    ack()
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+        style_id = int(meta.get("style_id"))
+        new_stage = int(meta.get("new_stage"))
+    except Exception:
+        logger.error("qty_update_submit: invalid private_metadata")
+        return
+
+    user_id = body["user"]["id"]
+    sty = get_style_by_id(style_id)
+    if not sty:
+        logger.warning(f"Style {style_id} vanished in qty submit")
+        return
+
+    def _to_int(v):
+        try:
+            return int(v) if v is not None and str(v).strip() != "" else None
+        except Exception:
+            return None
+
+    vals = view["state"]["values"]
+    cut_qty    = _to_int(vals.get("cut", {}).get("val", {}).get("value"))
+    stitch_qty = _to_int(vals.get("stitch", {}).get("val", {}).get("value"))
+    finish_qty = _to_int(vals.get("finish", {}).get("val", {}).get("value"))
+    pack_qty   = _to_int(vals.get("pack", {}).get("val", {}).get("value"))
+
+    update_style_stage(style_id, new_stage)
+    update_style_quantities(style_id, cut_qty=cut_qty, stitch_qty=stitch_qty, finish_qty=finish_qty, pack_qty=pack_qty)
+
+    parts = [f":truck: *Stage updated*", f"{sty.brand}·{sty.style_no} is now *{STAGE_LABELS[new_stage]}*"]
+    qparts = []
+    if cut_qty is not None:    qparts.append(f"Cut: {cut_qty}")
+    if stitch_qty is not None: qparts.append(f"Stitch: {stitch_qty}")
+    if finish_qty is not None: qparts.append(f"Finish: {finish_qty}")
+    if pack_qty is not None:   qparts.append(f"Pack: {pack_qty}")
+    if qparts:
+        parts.append("Quantities — " + ", ".join(qparts))
+    parts.append("\nTo download a CSV of your styles, type `/export-csv`.")
+    client.chat_postMessage(channel=user_id, text="\n".join(parts))
 
 # ---------- /morning-update (open huge modal) ----------
 @bolt_app.command("/morning-update")
@@ -208,13 +282,13 @@ def open_bulk_modal(ack, body, client):
 # ---------- modal submit ----------
 @bolt_app.view("bulk_stage_submit")
 def save_bulk_update(ack, body, view, client, logger):
-    ack()
+    # Parse desired changes first
     user_id = body["user"]["id"]
-    # Get merchant name for summary
     prof = client.users_info(user=user_id)["user"]["profile"]
     merchant = prof.get("display_name") or prof["real_name"]
-    changes, dispatched = [], []
 
+    desired_changes = []  # [{style_id, new_stage}]
+    flow_changes = []     # subset where new_stage in flow
     for blk_id, blk_val in view["state"]["values"].items():
         if not blk_id.startswith("style_"):
             continue
@@ -223,18 +297,62 @@ def save_bulk_update(ack, body, view, client, logger):
         sty = get_style_by_id(style_id)
         if not sty or sty.stage == new_stage:
             continue
+        desired_changes.append({"style_id": style_id, "new_stage": new_stage})
+        if new_stage in (8, 9, 10, 11, 12):
+            flow_changes.append({"style_id": style_id, "new_stage": new_stage, "brand": sty.brand, "style_no": sty.style_no})
+
+    # If any flow stages selected, push a quantity collection modal
+    if flow_changes:
+        # Build blocks asking for quantities for each flow style
+        blocks = []
+        for fc in flow_changes[:20]:  # safety cap
+            sid = fc["style_id"]
+            title = f"*{fc['brand']}* • {fc['style_no']}"
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": title}})
+            blocks.append({"type": "input", "block_id": f"cut_{sid}", "optional": True,
+                           "element": {"type": "plain_text_input", "action_id": "val"},
+                           "label": {"type": "plain_text", "text": "Cutting qty"}})
+            blocks.append({"type": "input", "block_id": f"stitch_{sid}", "optional": True,
+                           "element": {"type": "plain_text_input", "action_id": "val"},
+                           "label": {"type": "plain_text", "text": "Stitching qty"}})
+            blocks.append({"type": "input", "block_id": f"finish_{sid}", "optional": True,
+                           "element": {"type": "plain_text_input", "action_id": "val"},
+                           "label": {"type": "plain_text", "text": "Finishing qty"}})
+            blocks.append({"type": "input", "block_id": f"pack_{sid}", "optional": True,
+                           "element": {"type": "plain_text_input", "action_id": "val"},
+                           "label": {"type": "plain_text", "text": "Packing qty"}})
+            blocks.append({"type": "divider"})
+
+        ack(response_action="push", view={
+            "type": "modal",
+            "callback_id": "bulk_qty_submit",
+            "private_metadata": json.dumps({"changes": desired_changes}),
+            "title": {"type": "plain_text", "text": "Enter Quantities"},
+            "submit": {"type": "plain_text", "text": "Save"},
+            "blocks": blocks or [{"type": "section", "text": {"type": "mrkdwn", "text": "No changes."}}],
+        })
+        return
+
+    # No flow stages: proceed with original logic
+    ack()
+    changes, dispatched = [], []
+    for ch in desired_changes:
+        style_id = ch["style_id"]
+        new_stage = ch["new_stage"]
+        sty = get_style_by_id(style_id)
+        if not sty:
+            continue
         update_style_stage(style_id, new_stage)
         if new_stage == 13:
             dispatched.append(f"{sty.brand}·{sty.style_no}")
         changes.append(f"{sty.brand}·{sty.style_no} → *{STAGE_LABELS[new_stage]}*")
 
-    # Confirmation DM to merchant
     txt = ["✅ *Morning update received!*"]
     if changes:    txt += ["\n".join(changes)]
     if dispatched: txt += ["\n_Dispatched:_ " + ", ".join(dispatched)]
+    txt += ["\nTo download a CSV of your styles, type `/export-csv`."]
     client.chat_postMessage(channel=user_id, text="\n".join(txt))
 
-    # Also send summary to Harsh Lalwani
     harsh_id = get_harsh_user_id()
     if harsh_id and (changes or dispatched):
         summary = [f"Morning update from {merchant}:"]
@@ -244,6 +362,123 @@ def save_bulk_update(ack, body, view, client, logger):
             bolt_app.client.chat_postMessage(channel=harsh_id, text="\n".join(summary))
         except Exception as e:
             print(f"Failed to send summary to Harsh Lalwani: {e}")
+
+# New handler: bulk quantities submission
+@bolt_app.view("bulk_qty_submit")
+def handle_bulk_qty_submit(ack, body, view, client, logger):
+    ack()
+    try:
+        data = json.loads(view.get("private_metadata") or "{}")
+        desired_changes = data.get("changes", [])
+    except Exception:
+        desired_changes = []
+
+    user_id = body["user"]["id"]
+    prof = client.users_info(user=user_id)["user"]["profile"]
+    merchant = prof.get("display_name") or prof["real_name"]
+
+    def _to_int(v):
+        try:
+            return int(v) if v is not None and str(v).strip() != "" else None
+        except Exception:
+            return None
+
+    vals = view["state"]["values"]
+
+    changes, dispatched = [], []
+    for ch in desired_changes:
+        style_id = int(ch["style_id"])
+        new_stage = int(ch["new_stage"])
+        sty = get_style_by_id(style_id)
+        if not sty:
+            continue
+        update_style_stage(style_id, new_stage)
+        cut_qty    = _to_int(vals.get(f"cut_{style_id}", {}).get("val", {}).get("value"))
+        stitch_qty = _to_int(vals.get(f"stitch_{style_id}", {}).get("val", {}).get("value"))
+        finish_qty = _to_int(vals.get(f"finish_{style_id}", {}).get("val", {}).get("value"))
+        pack_qty   = _to_int(vals.get(f"pack_{style_id}", {}).get("val", {}).get("value"))
+        qty_parts = []
+        if cut_qty is not None:    qty_parts.append(f"Cut {cut_qty}")
+        if stitch_qty is not None: qty_parts.append(f"Stitch {stitch_qty}")
+        if finish_qty is not None: qty_parts.append(f"Finish {finish_qty}")
+        if pack_qty is not None:   qty_parts.append(f"Pack {pack_qty}")
+        if any(q is not None for q in (cut_qty, stitch_qty, finish_qty, pack_qty)):
+            update_style_quantities(style_id, cut_qty=cut_qty, stitch_qty=stitch_qty, finish_qty=finish_qty, pack_qty=pack_qty)
+        if new_stage == 13:
+            dispatched.append(f"{sty.brand}·{sty.style_no}")
+        change_line = f"{sty.brand}·{sty.style_no} → *{STAGE_LABELS[new_stage]}*"
+        if qty_parts:
+            change_line += " (" + ", ".join(qty_parts) + ")"
+        changes.append(change_line)
+
+    txt = ["✅ *Morning update received!*"]
+    if changes:    txt += ["\n".join(changes)]
+    if dispatched: txt += ["\n_Dispatched:_ " + ", ".join(dispatched)]
+    txt += ["\nTo download a CSV of your styles, type `/export-csv`."]
+    client.chat_postMessage(channel=user_id, text="\n".join(txt))
+
+    harsh_id = get_harsh_user_id()
+    if harsh_id and (changes or dispatched):
+        summary = [f"Morning update from {merchant}:"]
+        if changes:    summary += ["\n".join(changes)]
+        if dispatched: summary += ["\n_Dispatched:_ " + ", ".join(dispatched)]
+        try:
+            bolt_app.client.chat_postMessage(channel=harsh_id, text="\n".join(summary))
+        except Exception as e:
+            print(f"Failed to send summary to Harsh Lalwani: {e}")
+
+# ---------- Export CSV command ----------
+@bolt_app.command("/export-csv")
+def export_csv(ack, body, client, respond, logger):
+    ack()
+    try:
+        user_id = body.get("user_id")
+        profile = client.users_info(user=user_id)["user"]["profile"]
+        merchant = profile.get("display_name") or profile["real_name"]
+        rows = get_styles_by_merchant(merchant, active_only=True)
+        # Build CSV
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        header = [
+            "Brand", "Style No", "Description", "Colour", "Stage", "Total Qty",
+            "Total Cutting", "Total Stitching", "Total Finishing", "Total Packing",
+            "Dispatch Date", "Created At", "Active"
+        ]
+        writer.writerow(header)
+        for r in rows:
+            writer.writerow([
+                r.brand,
+                r.style_no,
+                r.garment,
+                r.colour,
+                STAGE_LABELS[r.stage],
+                getattr(r, "total_qty", None),
+                getattr(r, "cut_qty", None),
+                getattr(r, "stitch_qty", None),
+                getattr(r, "finish_qty", None),
+                getattr(r, "pack_qty", None),
+                getattr(r, "dispatch_date", None),
+                r.created_at.isoformat(),
+                getattr(r, "active", True),
+            ])
+        content = buf.getvalue()
+        buf.close()
+
+        # Open IM and upload file
+        im = client.conversations_open(users=user_id)
+        channel_id = im["channel"]["id"]
+        filename = f"styles_{merchant.replace(' ', '_').lower()}.csv"
+        client.files_upload(
+            channels=channel_id,
+            content=content,
+            filename=filename,
+            filetype="csv",
+            initial_comment=":arrow_down: Here is your CSV export of active styles.",
+            title=f"{merchant} styles export"
+        )
+    except Exception as e:
+        logger.error(f"/export-csv failed: {e}")
+        respond(text=":warning: Failed to generate CSV. Please try again.", response_type="ephemeral")
 
 
 flask_app = Flask(__name__)     # single Flask wrapper
@@ -300,7 +535,17 @@ def open_add_style_modal(ack, body, client):
 
                 { "type": "input", "block_id": "color",
                   "element": { "type": "plain_text_input", "action_id": "val" },
-                  "label": { "type": "plain_text", "text": "Colour" } }
+                  "label": { "type": "plain_text", "text": "Colour" } },
+
+                { "type": "input", "block_id": "total_qty",
+                  "optional": True,
+                  "element": { "type": "plain_text_input", "action_id": "val" },
+                  "label": { "type": "plain_text", "text": "Total Quantity (optional)" } },
+
+                { "type": "input", "block_id": "dispatch_date",
+                  "optional": True,
+                  "element": { "type": "plain_text_input", "action_id": "val", "placeholder": {"type":"plain_text","text":"YYYY-MM-DD"}},
+                  "label": { "type": "plain_text", "text": "Dispatch Date (optional)" } }
             ]
         }
     )
@@ -349,7 +594,17 @@ def handle_garment_selection(ack, body, client, logger):
 
                     { "type": "input", "block_id": "color",
                       "element": { "type": "plain_text_input", "action_id": "val" },
-                      "label": { "type": "plain_text", "text": "Colour" } }
+                      "label": { "type": "plain_text", "text": "Colour" } },
+
+                    { "type": "input", "block_id": "total_qty",
+                      "optional": True,
+                      "element": { "type": "plain_text_input", "action_id": "val" },
+                      "label": { "type": "plain_text", "text": "Total Quantity (optional)" } },
+
+                    { "type": "input", "block_id": "dispatch_date",
+                      "optional": True,
+                      "element": { "type": "plain_text_input", "action_id": "val", "placeholder": {"type":"plain_text","text":"YYYY-MM-DD"}},
+                      "label": { "type": "plain_text", "text": "Dispatch Date (optional)" } }
                 ]
             }
         )
@@ -391,7 +646,17 @@ def handle_garment_selection(ack, body, client, logger):
 
                     { "type": "input", "block_id": "color",
                       "element": { "type": "plain_text_input", "action_id": "val" },
-                      "label": { "type": "plain_text", "text": "Colour" } }
+                      "label": { "type": "plain_text", "text": "Colour" } },
+
+                    { "type": "input", "block_id": "total_qty",
+                      "optional": True,
+                      "element": { "type": "plain_text_input", "action_id": "val" },
+                      "label": { "type": "plain_text", "text": "Total Quantity (optional)" } },
+
+                    { "type": "input", "block_id": "dispatch_date",
+                      "optional": True,
+                      "element": { "type": "plain_text_input", "action_id": "val", "placeholder": {"type":"plain_text","text":"YYYY-MM-DD"}},
+                      "label": { "type": "plain_text", "text": "Dispatch Date (optional)" } }
                 ]
             }
         )
@@ -406,6 +671,18 @@ def handle_add_style_submission(ack, body, view, client, logger):
     style_no  = vals["style_no"]["val"]["value"]
     garment_selection = vals["garment"]["garment_select"]["selected_option"]["text"]["text"]
     color     = vals["color"]["val"]["value"]
+
+    def _to_int(v):
+        try:
+            return int(v) if v is not None and str(v).strip() != "" else None
+        except Exception:
+            return None
+
+    total_qty = _to_int(vals.get("total_qty", {}).get("val", {}).get("value"))
+    dispatch_date = vals.get("dispatch_date", {}).get("val", {}).get("value")
+    if dispatch_date is not None and str(dispatch_date).strip() == "":
+        dispatch_date = None
+
     user_id   = body["user"]["id"]
 
     # Handle custom garment type
@@ -428,6 +705,8 @@ def handle_add_style_submission(ack, body, view, client, logger):
         style_no=style_no,
         garment=garment,
         colour=color,
+        total_qty=total_qty,
+        dispatch_date=dispatch_date,
     )
 
     logger.info(f"New style from {user_id}: {brand}-{style_no}")
@@ -438,6 +717,10 @@ def handle_add_style_submission(ack, body, view, client, logger):
         f"• *Type:* {garment}\n"
         f"• *Colour:* {color}"
     )
+    if total_qty is not None:
+        msg += f"\n• *Total Qty:* {total_qty}"
+    if dispatch_date:
+        msg += f"\n• *Dispatch Date:* {dispatch_date}"
     client.chat_postMessage(channel=user_id,
                             text=":white_check_mark: Style saved!\n" + msg)
 
@@ -460,7 +743,7 @@ def handle_get_info(ack, respond):
                     "type": "mrkdwn",
                     "text": "*🛠️ Available Commands:*\n"
                             "`/add-style` – Add a new garment style with optional photo\n"
-                            "`/update-status` – Update the production stage of an existing style\n"
+                            "`/update-stage` – Update the production stage of an existing style\n"
                             "`/current-styles` – View all styles you're handling\n"
                             "`/morning-update` – Bulk update all your styles for today\n"
                             "`/get-info` – Show this help message"
@@ -509,51 +792,91 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from pytz import timezone
 import datetime
 
-# Only send reminders to these merchants (for testing)
-ALLOWED_MERCHANTS = {"Siddharth", "Megha"}
+# Use Slack user group to control who receives reminders
+MERCHANT_USERGROUP_HANDLE = "merchant"
+
+def get_usergroup_member_ids(handle_or_name: str = MERCHANT_USERGROUP_HANDLE):
+    """Return a set of Slack user IDs who are members of the given user group.
+    Requires appropriate Slack scopes (usergroups:read).
+    """
+    try:
+        usergroups = bolt_app.client.usergroups_list().get("usergroups", [])
+        target = next(
+            (
+                ug for ug in usergroups
+                if ug.get("handle", "").lower() == handle_or_name.lower()
+                or ug.get("name", "").lower() == handle_or_name.lower()
+            ),
+            None,
+        )
+        if not target:
+            return set()
+        users = bolt_app.client.usergroups_users_list(usergroup=target["id"]).get("users", [])
+        return set(users)
+    except Exception as e:
+        print(f"Could not fetch user group '{handle_or_name}': {e}")
+        return set()
 
 def send_daily_reminder():
     styles = get_all_styles()
-    merchants = {s.merchant for s in styles if s.active}
-    if not merchants:
+    # merchants with at least one active style
+    merchants_with_active = {s.merchant for s in styles if getattr(s, "active", False)}
+    if not merchants_with_active:
         return
-    for merchant in merchants:
-        if merchant not in ALLOWED_MERCHANTS:
+
+    # Latest active style per merchant (for sorting/context if needed)
+    latest_style_by_merchant = {}
+    for s in styles:
+        if not getattr(s, "active", False):
             continue
-        merchant_styles = [s for s in styles if s.merchant == merchant and s.active]
-        if not merchant_styles:
+        prev = latest_style_by_merchant.get(s.merchant)
+        if prev is None or s.created_at > prev.created_at:
+            latest_style_by_merchant[s.merchant] = s
+
+    # Fetch Slack user IDs that are members of the merchant user group
+    merchant_group_member_ids = get_usergroup_member_ids(MERCHANT_USERGROUP_HANDLE)
+    if not merchant_group_member_ids:
+        print("No members found in 'merchant' user group or missing scope; skipping reminders.")
+        return
+
+    # Build a quick lookup from merchant name -> Slack user ID using users_list
+    try:
+        members = bolt_app.client.users_list().get("members", [])
+    except Exception as e:
+        print(f"Could not fetch Slack users_list: {e}")
+        return
+
+    name_to_user_id = {}
+    for u in members:
+        user_id = u.get("id")
+        prof = u.get("profile", {})
+        dn = prof.get("display_name")
+        rn = prof.get("real_name")
+        if dn:
+            name_to_user_id[dn] = user_id
+        if rn:
+            name_to_user_id[rn] = user_id
+
+    # Send a reminder DM only if the merchant is in the user group
+    for merchant in sorted(merchants_with_active):
+        user_id = name_to_user_id.get(merchant)
+        if not user_id or user_id not in merchant_group_member_ids:
             continue
-        merchant_styles.sort(key=lambda s: s.created_at, reverse=True)
-        style = merchant_styles[0]
-        # Try to find the Slack user_id for this merchant
+
+        msg = (
+            "Good morning! ☀️\n\n"
+            "Please fill in your daily style report using `/morning-update`.\n\n"
+            "*Available commands:*\n"
+            "• `/add-style` — Add a new style\n"
+            "• `/current-styles` — See your active styles and their current stage\n"
+            "• `/update-stage` — Update the stage for a single style\n"
+            "• `/morning-update` — Bulk update all your styles for today\n\n"
+            "Click the `/morning-update` command or type it in any channel to get started!"
+        )
         try:
-            users = bolt_app.client.users_list()["members"]
-            user_id = None
-            for u in users:
-                prof = u.get("profile", {})
-                if prof.get("display_name") == merchant or prof.get("real_name") == merchant:
-                    user_id = u["id"]
-                    break
-            if not user_id:
-                continue
+            bolt_app.client.chat_postMessage(channel=user_id, text=msg)
         except Exception as e:
-            print(f"Could not find user for merchant {merchant}: {e}")
-            continue
-        # Compose the message
-            msg = (
-                "Good morning! ☀️\n\n"
-                "Please fill in your daily style report using `/morning-update`.\n\n"
-                "*Available commands:*\n"
-                "• `/add-style` — Add a new style\n"
-                "• `/current-styles` — See your active styles and their current stage\n"
-                "• `/update-stage` — Update the stage for a single style\n"
-                "• `/morning-update` — Bulk update all your styles for today\n\n"
-                "Click the `/morning-update` command or type it in any channel to get started!"
-            )
-            try:
-                bolt_app.client.chat_postMessage(channel=user_id, text=msg)
-            except Exception as e:
-                print(f"Failed to send DM to {merchant}: {e}")
+            print(f"Failed to send DM to {merchant} ({user_id}): {e}")
 
 # Schedule the job at 9:30 AM IST
 def start_scheduler():
@@ -574,6 +897,22 @@ def get_harsh_user_id():
         print(f"Could not find Harsh Lalwani: {e}")
     return None
 
+@bolt_app.command("/remind-merchants")
+def remind_merchants(ack, body, client, respond, logger):
+    ack()
+    try:
+        user_id = body.get("user_id")
+        prof = client.users_info(user=user_id)["user"]["profile"]
+        caller_name = prof.get("display_name") or prof.get("real_name")
+        if caller_name != "Aaryan":
+            respond(text=":no_entry: You are not authorized to use this command.", response_type="ephemeral")
+            return
+        # Trigger the same reminder flow used by the daily scheduler
+        send_daily_reminder()
+        respond(text=":white_check_mark: Morning reminder sent to the merchant group.", response_type="ephemeral")
+    except Exception as e:
+        logger.error(f"/remind-merchants failed: {e}")
+        respond(text=":warning: Failed to send reminders. Please try again.", response_type="ephemeral")
 
 
 @flask_app.route("/")

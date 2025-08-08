@@ -28,9 +28,9 @@ STAGE_LABELS = [
     "PP",
     "Accessories in-house",
     "Cutting sheet",
+    "Inline",
     "Stitching",
     "Finishing",
-    "Inline",
     "Packing",
     "Dispatch",
 ]
@@ -55,8 +55,10 @@ def _to_style(doc) -> SimpleNamespace:
 # CRUD helpers
 # ---------------------------------------------------------------------------
 
-def add_style(merchant: str, brand: str, style_no: str, garment: str, colour: str) -> int:
-    """Add a new style to the database and return its ID."""
+def add_style(merchant: str, brand: str, style_no: str, garment: str, colour: str, total_qty: Optional[int] = None, dispatch_date: Optional[str] = None) -> int:
+    """Add a new style to the database and return its ID.
+    total_qty is optional integer; dispatch_date is optional ISO date string (YYYY-MM-DD).
+    """
 
     doc_id = _styles.insert(
         {
@@ -73,9 +75,12 @@ def add_style(merchant: str, brand: str, style_no: str, garment: str, colour: st
             "acc_trims": None,
             "acc_washcare": None,
             "acc_other": None,
+            "cut_qty": None,
             "stitch_qty": None,
             "finish_qty": None,
             "pack_qty": None,
+            "total_qty": int(total_qty) if total_qty is not None else None,
+            "dispatch_date": dispatch_date,
         }
     )
     return int(doc_id)
@@ -116,6 +121,22 @@ def update_style_stage(style_id: int, stage: int) -> None:
     doc["stage"] = stage
     if stage == 13:  # Dispatch stage → deactivate
         doc["active"] = False
+    _styles.update(doc, doc_ids=[style_id])
+
+
+def update_style_quantities(style_id: int, stitch_qty: Optional[int] = None, finish_qty: Optional[int] = None, pack_qty: Optional[int] = None, cut_qty: Optional[int] = None) -> None:
+    """Update quantity fields for a style. Only provided fields are updated."""
+    doc = _styles.get(doc_id=style_id)
+    if not doc:
+        return
+    if cut_qty is not None:
+        doc["cut_qty"] = int(cut_qty)
+    if stitch_qty is not None:
+        doc["stitch_qty"] = int(stitch_qty)
+    if finish_qty is not None:
+        doc["finish_qty"] = int(finish_qty)
+    if pack_qty is not None:
+        doc["pack_qty"] = int(pack_qty)
     _styles.update(doc, doc_ids=[style_id])
 
 
