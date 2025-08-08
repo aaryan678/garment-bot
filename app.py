@@ -835,65 +835,42 @@ def get_usergroup_member_ids(handle_or_name: str = MERCHANT_USERGROUP_HANDLE):
         return set()
 
 def send_daily_reminder():
-    styles = get_all_styles()
-    # merchants with at least one active style
-    merchants_with_active = {s.merchant for s in styles if getattr(s, "active", False)}
-    if not merchants_with_active:
-        return
-
-    # Latest active style per merchant (for sorting/context if needed)
-    latest_style_by_merchant = {}
-    for s in styles:
-        if not getattr(s, "active", False):
-            continue
-        prev = latest_style_by_merchant.get(s.merchant)
-        if prev is None or s.created_at > prev.created_at:
-            latest_style_by_merchant[s.merchant] = s
-
     # Fetch Slack user IDs that are members of the merchant user group
     merchant_group_member_ids = get_usergroup_member_ids(MERCHANT_USERGROUP_HANDLE)
     if not merchant_group_member_ids:
         print("No members found in 'merchant' user group or missing scope; skipping reminders.")
         return
 
-    # Build a quick lookup from merchant name -> Slack user ID using users_list
+    # Fetch all users to filter out bots/deactivated and for logging if needed
     try:
         members = bolt_app.client.users_list().get("members", [])
+        id_to_member = {m.get("id"): m for m in members}
     except Exception as e:
         print(f"Could not fetch Slack users_list: {e}")
-        return
+        id_to_member = {}
 
-    name_to_user_id = {}
-    for u in members:
-        user_id = u.get("id")
-        prof = u.get("profile", {})
-        dn = prof.get("display_name")
-        rn = prof.get("real_name")
-        if dn:
-            name_to_user_id[dn] = user_id
-        if rn:
-            name_to_user_id[rn] = user_id
+    msg = (
+        "Good morning! ☀️\n\n"
+        "Please fill in your daily style report using `/morning-update`.\n\n"
+        "*Available commands:*\n"
+        "• `/add-style` — Add a new style\n"
+        "• `/current-styles` — See your active styles and their current stage\n"
+        "• `/update-stage` — Update the stage for a single style\n"
+        "• `/morning-update` — Bulk update all your styles for today\n\n"
+        "Click the `/morning-update` command or type it in any channel to get started!"
+    )
 
-    # Send a reminder DM only if the merchant is in the user group
-    for merchant in sorted(merchants_with_active):
-        user_id = name_to_user_id.get(merchant)
-        if not user_id or user_id not in merchant_group_member_ids:
+    for user_id in sorted(merchant_group_member_ids):
+        m = id_to_member.get(user_id, {})
+        if m.get("deleted") or m.get("is_bot") or m.get("id") is None:
             continue
-
-        msg = (
-            "Good morning! ☀️\n\n"
-            "Please fill in your daily style report using `/morning-update`.\n\n"
-            "*Available commands:*\n"
-            "• `/add-style` — Add a new style\n"
-            "• `/current-styles` — See your active styles and their current stage\n"
-            "• `/update-stage` — Update the stage for a single style\n"
-            "• `/morning-update` — Bulk update all your styles for today\n\n"
-            "Click the `/morning-update` command or type it in any channel to get started!"
-        )
         try:
-            bolt_app.client.chat_postMessage(channel=user_id, text=msg)
+            # Ensure we have an open DM channel to the user
+            im = bolt_app.client.conversations_open(users=user_id)
+            channel_id = im["channel"]["id"]
+            bolt_app.client.chat_postMessage(channel=channel_id, text=msg)
         except Exception as e:
-            print(f"Failed to send DM to {merchant} ({user_id}): {e}")
+            print(f"Failed to send DM to {user_id}: {e}")
 
 # Schedule the job at 9:30 AM IST
 def start_scheduler():
