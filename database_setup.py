@@ -140,6 +140,34 @@ def update_style_quantities(style_id: int, stitch_qty: Optional[int] = None, fin
     _styles.update(doc, doc_ids=[style_id])
 
 
+def update_style_info(
+    style_id: int,
+    brand: Optional[str] = None,
+    style_no: Optional[str] = None,
+    garment: Optional[str] = None,
+    colour: Optional[str] = None,
+    total_qty: Optional[int] = None,
+    dispatch_date: Optional[str] = None,
+) -> None:
+    """Update core info fields for a style. Only provided fields are updated."""
+    doc = _styles.get(doc_id=style_id)
+    if not doc:
+        return
+    if brand is not None:
+        doc["brand"] = brand
+    if style_no is not None:
+        doc["style_no"] = style_no
+    if garment is not None:
+        doc["garment"] = garment
+    if colour is not None:
+        doc["colour"] = colour
+    if total_qty is not None:
+        doc["total_qty"] = int(total_qty)
+    if dispatch_date is not None:
+        doc["dispatch_date"] = dispatch_date
+    _styles.update(doc, doc_ids=[style_id])
+
+
 def delete_style(style_id: int) -> bool:
     """Soft delete a style by setting active=False."""
 

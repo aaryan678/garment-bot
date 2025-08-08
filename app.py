@@ -19,6 +19,7 @@ from database_setup import (
     get_styles_by_merchant,
     update_style_stage,
     update_style_quantities,
+    update_style_info,
 )
 
 load_dotenv()  # pulls SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET from .env
@@ -445,23 +446,55 @@ def export_csv(ack, body, client, respond, logger):
         writer = csv.writer(buf)
         header = [
             "Brand", "Style No", "Description", "Colour", "Stage", "Total Qty",
-            "Total Cutting", "Total Stitching", "Total Finishing", "Total Packing",
+            "Total Cutting", "Cutting Balance",
+            "Total Stitching", "Stitching Balance",
+            "Total Finishing", "Finishing Balance",
+            "Total Packing", "Packing Balance",
             "Dispatch Date", "Created At", "Active"
         ]
         writer.writerow(header)
+
+        def norm_num(n):
+            try:
+                n_int = int(n)
+                return "" if n_int <= 0 else n_int
+            except Exception:
+                return ""
+
+        def balance(total, qty):
+            try:
+                t = int(total)
+                q = int(qty)
+                if t <= 0 or q <= 0:
+                    return ""
+                b = t - q
+                return b if b >= 0 else 0
+            except Exception:
+                return ""
+
         for r in rows:
+            total_qty = getattr(r, "total_qty", None)
+            cut = getattr(r, "cut_qty", None)
+            stitch = getattr(r, "stitch_qty", None)
+            finish = getattr(r, "finish_qty", None)
+            pack = getattr(r, "pack_qty", None)
+
             writer.writerow([
                 r.brand,
                 r.style_no,
                 r.garment,
                 r.colour,
                 STAGE_LABELS[r.stage],
-                getattr(r, "total_qty", None),
-                getattr(r, "cut_qty", None),
-                getattr(r, "stitch_qty", None),
-                getattr(r, "finish_qty", None),
-                getattr(r, "pack_qty", None),
-                getattr(r, "dispatch_date", None),
+                norm_num(total_qty) if isinstance(total_qty, int) else (total_qty if isinstance(total_qty, str) else total_qty) or "",
+                norm_num(cut),
+                balance(total_qty, cut),
+                norm_num(stitch),
+                balance(total_qty, stitch),
+                norm_num(finish),
+                balance(total_qty, finish),
+                norm_num(pack),
+                balance(total_qty, pack),
+                getattr(r, "dispatch_date", "") or "",
                 r.created_at.isoformat(),
                 getattr(r, "active", True),
             ])
@@ -923,6 +956,135 @@ def remind_merchants(ack, body, client, respond, logger):
     except Exception as e:
         logger.error(f"/remind-merchants failed: {e}")
         respond(text=":warning: Failed to send reminders. Please try again.", response_type="ephemeral")
+
+@bolt_app.command("/edit-style")
+def open_edit_style_selector(ack, body, client):
+    ack()
+    user_id = body["user_id"]
+    prof    = client.users_info(user=user_id)["user"]["profile"]
+    merchant = prof.get("display_name") or prof["real_name"]
+
+    rows = sorted(
+        get_styles_by_merchant(merchant, active_only=True),
+        key=lambda r: r.created_at,
+    )
+    if not rows:
+        client.chat_postEphemeral(
+            channel=body["channel_id"], user=user_id,
+            text="You have no active styles."
+        )
+        return
+
+    style_opts = [{
+        "text":  { "type":"plain_text",
+                   "text": f"{r.brand}·{r.style_no} ({r.garment})" },
+        "value": str(r.id)
+    } for r in rows]
+
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view={
+            "type":"modal",
+            "callback_id":"edit_style_select_submit",
+            "title":  { "type":"plain_text", "text":"Edit Style" },
+            "submit": { "type":"plain_text", "text":"Next" },
+            "blocks":[
+                { "type":"input", "block_id":"style",
+                  "element": { "type":"static_select",
+                               "action_id":"val",
+                               "options":style_opts },
+                  "label": { "type":"plain_text", "text":"Select Style" }}
+            ]
+        }
+    )
+
+@bolt_app.view("edit_style_select_submit")
+def open_prefilled_edit_modal(ack, body, view, client, logger):
+    ack()
+    try:
+        style_id = int(view["state"]["values"]["style"]["val"]["selected_option"]["value"])
+    except Exception:
+        return
+    sty = get_style_by_id(style_id)
+    if not sty:
+        return
+
+    def txt(v):
+        return {"type":"plain_text_input", "action_id":"val", "initial_value": str(v) if v is not None else ""}
+
+    blocks = [
+        {"type":"section", "text": {"type":"mrkdwn", "text": f"*Editing:* {sty.brand} • {sty.style_no}"}},
+        {"type":"input", "block_id":"brand", "element": txt(sty.brand), "label": {"type":"plain_text", "text":"Brand"}},
+        {"type":"input", "block_id":"style_no", "element": txt(sty.style_no), "label": {"type":"plain_text", "text":"Exact Style No."}},
+        {"type":"input", "block_id":"garment", "element": txt(sty.garment), "label": {"type":"plain_text", "text":"Garment Type"}},
+        {"type":"input", "block_id":"color", "element": txt(sty.colour), "label": {"type":"plain_text", "text":"Colour"}},
+        {"type":"input", "block_id":"total_qty", "optional": True, "element": txt(getattr(sty, "total_qty", "") or ""), "label": {"type":"plain_text", "text":"Total Quantity (optional)"}},
+        {"type":"input", "block_id":"dispatch_date", "optional": True, "element": txt(getattr(sty, "dispatch_date", "") or ""), "label": {"type":"plain_text", "text":"Dispatch Date (optional)"}},
+    ]
+
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view={
+            "type":"modal",
+            "callback_id":"edit_style_submit",
+            "private_metadata": json.dumps({"style_id": style_id}),
+            "title":  { "type":"plain_text", "text":"Edit Style" },
+            "submit": { "type":"plain_text", "text":"Save" },
+            "blocks": blocks
+        }
+    )
+
+@bolt_app.view("edit_style_submit")
+def handle_edit_style_submit(ack, body, view, client, logger):
+    ack(response_action="clear")
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+        style_id = int(meta.get("style_id"))
+    except Exception:
+        return
+
+    vals = view["state"]["values"]
+    def _get(block):
+        return vals.get(block, {}).get("val", {}).get("value")
+
+    def _to_int(v):
+        try:
+            return int(v) if v is not None and str(v).strip() != "" else None
+        except Exception:
+            return None
+
+    brand = _get("brand")
+    style_no = _get("style_no")
+    garment = _get("garment")
+    colour = _get("color")
+    total_qty = _to_int(_get("total_qty"))
+    dispatch_date = _get("dispatch_date")
+    if dispatch_date is not None and str(dispatch_date).strip() == "":
+        dispatch_date = None
+
+    update_style_info(
+        style_id,
+        brand=brand,
+        style_no=style_no,
+        garment=garment,
+        colour=colour,
+        total_qty=total_qty,
+        dispatch_date=dispatch_date,
+    )
+
+    user_id = body["user"]["id"]
+    client.chat_postMessage(
+        channel=user_id,
+        text=(
+            ":white_check_mark: Style updated!\n"
+            f"• Brand: {brand}\n"
+            f"• Style No.: {style_no}\n"
+            f"• Type: {garment}\n"
+            f"• Colour: {colour}\n"
+            + (f"• Total Qty: {total_qty}\n" if total_qty is not None else "")
+            + (f"• Dispatch Date: {dispatch_date}\n" if dispatch_date else "")
+        )
+    )
 
 
 @flask_app.route("/")
