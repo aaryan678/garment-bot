@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from flask import Flask, request
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
+from slack_sdk import WebClient
 
 
 
@@ -795,12 +796,24 @@ import datetime
 # Use Slack user group to control who receives reminders
 MERCHANT_USERGROUP_HANDLE = "merchant"
 
+def _get_user_scoped_client() -> WebClient:
+    """Return a WebClient using a user token if provided, else the bot token.
+    For usergroups.* APIs, Slack typically requires a user token with usergroups:read.
+    """
+    user_token = os.environ.get("SLACK_USER_TOKEN")
+    if user_token:
+        return WebClient(token=user_token)
+    # Fallback to bot token (may fail with missing_scope)
+    return WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
+
+
 def get_usergroup_member_ids(handle_or_name: str = MERCHANT_USERGROUP_HANDLE):
     """Return a set of Slack user IDs who are members of the given user group.
-    Requires appropriate Slack scopes (usergroups:read).
+    Requires appropriate Slack scopes (usergroups:read) on a user token.
     """
     try:
-        usergroups = bolt_app.client.usergroups_list().get("usergroups", [])
+        client_user = _get_user_scoped_client()
+        usergroups = client_user.usergroups_list().get("usergroups", [])
         target = next(
             (
                 ug for ug in usergroups
@@ -810,11 +823,15 @@ def get_usergroup_member_ids(handle_or_name: str = MERCHANT_USERGROUP_HANDLE):
             None,
         )
         if not target:
+            print(f"User group '{handle_or_name}' not found. Check the handle/name.")
             return set()
-        users = bolt_app.client.usergroups_users_list(usergroup=target["id"]).get("users", [])
+        users = client_user.usergroups_users_list(usergroup=target["id"]).get("users", [])
         return set(users)
     except Exception as e:
-        print(f"Could not fetch user group '{handle_or_name}': {e}")
+        print(
+            "Could not fetch user group members. Likely missing 'SLACK_USER_TOKEN' with usergroups:read. "
+            f"Error: {e}"
+        )
         return set()
 
 def send_daily_reminder():
