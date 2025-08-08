@@ -508,8 +508,9 @@ def slack_events():
 def slack_command():
     return handler.handle(request)   # Bolt handles slash commands
 
-
-
+@flask_app.route("/healthz", methods=["GET"])
+def healthz():
+    return "ok", 200
 
 
 # ---------- /add-style slash-command ----------
@@ -935,7 +936,19 @@ def ping():
 
 if __name__ == "__main__":
     # Optional: print every incoming request for quick debugging
-    import logging, sys
+    import logging, sys, time
     logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
-    start_scheduler()
-    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
+
+    # Local dev: run Flask; optional scheduler
+    if os.getenv("RUN_SCHEDULER") == "1":
+        start_scheduler()
+        print("Scheduler started (RUN_SCHEDULER=1). Keeping process alive...")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+    else:
+        # Local dev server only; on Render use Gunicorn to serve flask_app
+        start_scheduler()
+        flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
